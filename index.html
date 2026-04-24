@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ant Colony Foraging Simulation</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c1014;
+      --panel: rgba(18, 24, 30, 0.82);
+      --text: #dce5ee;
+      --muted: #9bb0c3;
+      --accent: #74d9ff;
+      --food: #79e08f;
+      --nest: #d9a86c;
+      --obstacle: #495463;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 15% 20%, #1a2431 0%, transparent 45%),
+        radial-gradient(circle at 80% 70%, #19263b 0%, transparent 40%),
+        var(--bg);
+      color: var(--text);
+      font: 500 14px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+
+    .frame {
+      width: min(95vw, 1120px);
+      border: 1px solid rgba(200, 220, 240, 0.16);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(4px);
+    }
+
+    .hud {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 10px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid rgba(200, 220, 240, 0.12);
+    }
+
+    .hud span {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.025em;
+    }
+
+    .hud strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: linear-gradient(180deg, rgba(12, 16, 20, 0.7), rgba(8, 11, 15, 0.95));
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <div class="hud">
+      <span><strong>Ant Colony Foraging</strong> — local rules create global shortest-path routing</span>
+      <span>Ants: <strong id="antCount"></strong> · Food collected: <strong id="foodDelivered">0</strong> · Pheromone evaporation: <strong id="evapRate"></strong></span>
+    </div>
+    <canvas id="sim" width="1100" height="700"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('sim');
+    const ctx = canvas.getContext('2d');
+
+    const w = canvas.width;
+    const h = canvas.height;
+
+    const ANT_COUNT = 520;
+    const CELL = 4;
+    const GRID_W = Math.ceil(w / CELL);
+    const GRID_H = Math.ceil(h / CELL);
+    const TAU = Math.PI * 2;
+    const MAX_PHER = 255;
+    const EVAP = 0.0075;
+    const DIFFUSE = 0.11;
+
+    document.getElementById('antCount').textContent = ANT_COUNT;
+    document.getElementById('evapRate').textContent = `${(EVAP * 100).toFixed(2)}% / tick`;
+
+    const foodDeliveredEl = document.getElementById('foodDelivered');
+
+    const nest = { x: w * 0.5, y: h * 0.5, r: 18 };
+    let delivered = 0;
+
+    const homePher = new Float32Array(GRID_W * GRID_H);
+    const foodPher = new Float32Array(GRID_W * GRID_H);
+    const obstaclesMask = new Uint8Array(GRID_W * GRID_H);
+
+    const obstacles = [
+      { x: 260, y: 205, w: 160, h: 44, rot: -0.36 },
+      { x: 470, y: 360, w: 260, h: 38, rot: 0.23 },
+      { x: 700, y: 170, w: 220, h: 44, rot: -0.18 },
+      { x: 135, y: 470, w: 280, h: 42, rot: 0.15 },
+      { x: 760, y: 510, w: 190, h: 36, rot: -0.28 }
+    ];
+
+    const foods = [
+      { x: 130, y: 120, amount: 1000, radius: 14 },
+      { x: 980, y: 130, amount: 1000, radius: 14 },
+      { x: 1020, y: 585, amount: 1000, radius: 14 },
+      { x: 115, y: 595, amount: 1000, radius: 14 },
+      { x: 835, y: 345, amount: 1200, radius: 13 },
+      { x: 265, y: 350, amount: 1200, radius: 13 }
+    ];
+
+    function idx(gx, gy) {
+      return gy * GRID_W + gx;
+    }
+
+    function worldToGrid(x, y) {
+      return {
+        gx: Math.max(0, Math.min(GRID_W - 1, (x / CELL) | 0)),
+        gy: Math.max(0, Math.min(GRID_H - 1, (y / CELL) | 0))
+      };
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function isBlocked(x, y) {
+      const { gx, gy } = worldToGrid(x, y);
+      return obstaclesMask[idx(gx, gy)] === 1;
+    }
+
+    function buildObstacleMask() {
+      for (let gy = 0; gy < GRID_H; gy++) {
+        for (let gx = 0; gx < GRID_W; gx++) {
+          const x = gx * CELL + CELL * 0.5;
+          const y = gy * CELL + CELL * 0.5;
+          let blocked = false;
+          for (const ob of obstacles) {
+            const cx = ob.x + ob.w * 0.5;
+            const cy = ob.y + ob.h * 0.5;
+            const dx = x - cx;
+            const dy = y - cy;
+            const c = Math.cos(-ob.rot);
+            const s = Math.sin(-ob.rot);
+            const lx = dx * c - dy * s;
+            const ly = dx * s + dy * c;
+            if (Math.abs(lx) < ob.w * 0.5 && Math.abs(ly) < ob.h * 0.5) {
+              blocked = true;
+              break;
+            }
+          }
+          if (blocked) obstaclesMask[idx(gx, gy)] = 1;
+        }
+      }
+    }
+
+    buildObstacleMask();
+
+    const ants = Array.from({ length: ANT_COUNT }, () => {
+      const a = Math.random() * TAU;
+      return {
+        x: nest.x + Math.cos(a) * (Math.random() * nest.r),
+        y: nest.y + Math.sin(a) * (Math.random() * nest.r),
+        heading: Math.random() * TAU,
+        speed: 1.6 + Math.random() * 0.8,
+        carrying: false,
+        age: Math.random() * 300,
+        trip: 0
+      };
+    });
+
+    function samplePheromone(field, x, y) {
+      const { gx, gy } = worldToGrid(x, y);
+      return field[idx(gx, gy)];
+    }
+
+    function senseGradient(field, ant, senseDist = 9, spread = 0.55) {
+      const left = ant.heading - spread;
+      const right = ant.heading + spread;
+      const center = ant.heading;
+
+      const lx = ant.x + Math.cos(left) * senseDist;
+      const ly = ant.y + Math.sin(left) * senseDist;
+      const rx = ant.x + Math.cos(right) * senseDist;
+      const ry = ant.y + Math.sin(right) * senseDist;
+      const cx = ant.x + Math.cos(center) * senseDist;
+      const cy = ant.y + Math.sin(center) * senseDist;
+
+      const l = isBlocked(lx, ly) ? -1 : samplePheromone(field, lx, ly);
+      const r = isBlocked(rx, ry) ? -1 : samplePheromone(field, rx, ry);
+      const c = isBlocked(cx, cy) ? -1 : samplePheromone(field, cx, cy);
+
+      let steer = 0;
+      if (c >= l && c >= r) {
+        steer = 0;
+      } else if (l > r) {
+        steer = -0.22;
+      } else if (r > l) {
+        steer = 0.22;
+      }
+      return steer;
+    }
+
+    function layPheromone(field, x, y, value) {
+      const { gx, gy } = worldToGrid(x, y);
+      const i = idx(gx, gy);
+      field[i] = clamp(field[i] + value, 0, MAX_PHER);
+    }
+
+    function obstacleRepel(ant) {
+      let repelX = 0;
+      let repelY = 0;
+      const r = 16;
+      for (let oy = -r; oy <= r; oy += 6) {
+        for (let ox = -r; ox <= r; ox += 6) {
+          const px = ant.x + ox;
+          const py = ant.y + oy;
+          if (px < 0 || px > w || py < 0 || py > h) continue;
+          if (isBlocked(px, py)) {
+            const dx = ant.x - px;
+            const dy = ant.y - py;
+            const d2 = dx * dx + dy * dy + 0.001;
+            repelX += dx / d2;
+            repelY += dy / d2;
+          }
+        }
+      }
+      if (repelX !== 0 || repelY !== 0) {
+        const angle = Math.atan2(repelY, repelX);
+        const diff = Math.atan2(Math.sin(angle - ant.heading), Math.cos(angle - ant.heading));
+        ant.heading += diff * 0.25;
+      }
+    }
+
+    function updateAnt(ant) {
+      ant.age += 1;
+      ant.trip += 1;
+
+      const randomWalk = (Math.random() - 0.5) * 0.48; // Brownian component
+      const targetField = ant.carrying ? homePher : foodPher;
+      const steer = senseGradient(targetField, ant);
+
+      ant.heading += randomWalk + steer;
+      obstacleRepel(ant);
+
+      let nx = ant.x + Math.cos(ant.heading) * ant.speed;
+      let ny = ant.y + Math.sin(ant.heading) * ant.speed;
+
+      if (nx < 3 || nx > w - 3) {
+        ant.heading = Math.PI - ant.heading;
+        nx = clamp(nx, 3, w - 3);
+      }
+      if (ny < 3 || ny > h - 3) {
+        ant.heading = -ant.heading;
+        ny = clamp(ny, 3, h - 3);
+      }
+
+      if (isBlocked(nx, ny)) {
+        ant.heading += Math.PI * (0.65 + Math.random() * 0.45);
+        nx = ant.x + Math.cos(ant.heading) * ant.speed;
+        ny = ant.y + Math.sin(ant.heading) * ant.speed;
+        if (isBlocked(nx, ny)) {
+          nx = ant.x;
+          ny = ant.y;
+        }
+      }
+
+      ant.x = nx;
+      ant.y = ny;
+
+      if (ant.carrying) {
+        const intensity = clamp(10 + 120 / (6 + ant.trip), 4, 30);
+        layPheromone(foodPher, ant.x, ant.y, intensity);
+
+        const dn = Math.hypot(ant.x - nest.x, ant.y - nest.y);
+        if (dn < nest.r + 3) {
+          ant.carrying = false;
+          ant.trip = 0;
+          delivered += 1;
+          foodDeliveredEl.textContent = delivered;
+          ant.heading += Math.PI + (Math.random() - 0.5) * 0.7;
+        }
+      } else {
+        layPheromone(homePher, ant.x, ant.y, 6);
+
+        for (const f of foods) {
+          if (f.amount <= 0) continue;
+          const d = Math.hypot(ant.x - f.x, ant.y - f.y);
+          if (d < f.radius + 2) {
+            f.amount -= 1;
+            ant.carrying = true;
+            ant.trip = 0;
+            ant.heading += Math.PI + (Math.random() - 0.5) * 0.8;
+            layPheromone(foodPher, ant.x, ant.y, 140);
+            break;
+          }
+        }
+      }
+    }
+
+    const tmpHome = new Float32Array(homePher.length);
+    const tmpFood = new Float32Array(foodPher.length);
+
+    function diffuseAndEvaporate(src, dst) {
+      for (let gy = 1; gy < GRID_H - 1; gy++) {
+        const row = gy * GRID_W;
+        for (let gx = 1; gx < GRID_W - 1; gx++) {
+          const i = row + gx;
+          if (obstaclesMask[i]) {
+            dst[i] = 0;
+            continue;
+          }
+          const v = src[i];
+          const n = src[i - GRID_W];
+          const s = src[i + GRID_W];
+          const e = src[i + 1];
+          const wv = src[i - 1];
+          const mixed = v * (1 - DIFFUSE) + (n + s + e + wv) * (DIFFUSE * 0.25);
+          dst[i] = mixed * (1 - EVAP);
+        }
+      }
+    }
+
+    function stepPheromones() {
+      diffuseAndEvaporate(homePher, tmpHome);
+      diffuseAndEvaporate(foodPher, tmpFood);
+      homePher.set(tmpHome);
+      foodPher.set(tmpFood);
+    }
+
+    function drawPheromones() {
+      const image = ctx.createImageData(w, h);
+      const data = image.data;
+
+      for (let gy = 0; gy < GRID_H; gy++) {
+        for (let gx = 0; gx < GRID_W; gx++) {
+          const i = idx(gx, gy);
+          const hp = homePher[i];
+          const fp = foodPher[i];
+          const blocked = obstaclesMask[i] === 1;
+
+          const r = blocked ? 74 : clamp(fp * 1.4, 0, 190);
+          const g = blocked ? 83 : clamp((hp * 1.1 + fp * 0.1), 0, 180);
+          const b = blocked ? 96 : clamp(hp * 1.6, 0, 230);
+          const a = blocked ? 225 : clamp(Math.max(hp, fp) * 0.9, 0, 135);
+
+          const startX = gx * CELL;
+          const startY = gy * CELL;
+          for (let py = 0; py < CELL; py++) {
+            const y = startY + py;
+            if (y >= h) continue;
+            for (let px = 0; px < CELL; px++) {
+              const x = startX + px;
+              if (x >= w) continue;
+              const p = (y * w + x) * 4;
+              data[p] = r;
+              data[p + 1] = g;
+              data[p + 2] = b;
+              data[p + 3] = a;
+            }
+          }
+        }
+      }
+
+      ctx.putImageData(image, 0, 0);
+    }
+
+    function drawWorld() {
+      drawPheromones();
+
+      for (const ob of obstacles) {
+        ctx.save();
+        ctx.translate(ob.x + ob.w * 0.5, ob.y + ob.h * 0.5);
+        ctx.rotate(ob.rot);
+        ctx.fillStyle = 'rgba(80, 91, 106, 0.92)';
+        ctx.fillRect(-ob.w * 0.5, -ob.h * 0.5, ob.w, ob.h);
+        ctx.strokeStyle = 'rgba(180, 200, 220, 0.25)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(-ob.w * 0.5, -ob.h * 0.5, ob.w, ob.h);
+        ctx.restore();
+      }
+
+      for (const f of foods) {
+        if (f.amount <= 0) continue;
+        const ratio = clamp(f.amount / 1200, 0, 1);
+        ctx.fillStyle = `rgba(121, 224, 143, ${0.35 + ratio * 0.55})`;
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, f.radius + ratio * 6, 0, TAU);
+        ctx.fill();
+
+        ctx.fillStyle = 'rgba(168, 246, 180, 0.9)';
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, f.radius * 0.54, 0, TAU);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = 'rgba(217, 168, 108, 0.95)';
+      ctx.beginPath();
+      ctx.arc(nest.x, nest.y, nest.r + 4, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(69, 46, 25, 0.88)';
+      ctx.beginPath();
+      ctx.arc(nest.x, nest.y, nest.r * 0.56, 0, TAU);
+      ctx.fill();
+
+      for (const ant of ants) {
+        ctx.fillStyle = ant.carrying ? 'rgba(255, 232, 166, 0.95)' : 'rgba(240, 245, 255, 0.88)';
+        ctx.beginPath();
+        ctx.arc(ant.x, ant.y, ant.carrying ? 1.8 : 1.35, 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    function tick() {
+      for (let i = 0; i < ants.length; i++) updateAnt(ants[i]);
+      stepPheromones();
+      drawWorld();
+      requestAnimationFrame(tick);
+    }
+
+    // Seed nest-home pheromone for better return sensing at start.
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        const x = gx * CELL + CELL * 0.5;
+        const y = gy * CELL + CELL * 0.5;
+        const d = Math.hypot(x - nest.x, y - nest.y);
+        homePher[idx(gx, gy)] = clamp(120 - d * 0.35, 0, 120);
+      }
+    }
+
+    tick();
+  </script>
+</body>
+</html>
